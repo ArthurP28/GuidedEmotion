@@ -135,7 +135,6 @@ class DiffusionModel:
         
         return sqrt_alpha_cumprod_t * x_0 + sqrt_one_minus_alpha_cumprod_t * noise
 
-    @torch.no_grad()
     def p_sample(self, x_t, t, classifier=None, guidance_scale=1.0, target_label=None):
         """Reverse diffusion process: denoise images with optional classifier guidance"""
         batch_size = x_t.shape[0]
@@ -143,42 +142,46 @@ class DiffusionModel:
         
         # Predict noise
         if classifier is not None and guidance_scale > 0 and target_label is not None:
-            # Classifier guidance
-            x_t.requires_grad_(True)
-            predicted_noise = self.model(x_t, t_batch)
+            # Classifier guidance - need gradients enabled
+            with torch.enable_grad():
+                x_t_grad = x_t.detach().requires_grad_(True)
+                
+                # Get classifier gradient
+                logits = classifier(x_t_grad)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                selected = log_probs[range(len(logits)), target_label]
+                grad = torch.autograd.grad(selected.sum(), x_t_grad)[0]
             
-            # Get classifier gradient
-            logits = classifier(x_t)
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            selected = log_probs[range(len(logits)), target_label]
-            grad = torch.autograd.grad(selected.sum(), x_t)[0]
-            
-            # Add gradient guidance
-            predicted_noise = predicted_noise - guidance_scale * grad * self.sqrt_one_minus_alphas_cumprod[t]
-            x_t.requires_grad_(False)
+            # Predict noise without gradients
+            with torch.no_grad():
+                predicted_noise = self.model(x_t, t_batch)
+                # Add gradient guidance
+                predicted_noise = predicted_noise - guidance_scale * grad * self.sqrt_one_minus_alphas_cumprod[t]
         else:
-            predicted_noise = self.model(x_t, t_batch)
+            with torch.no_grad():
+                predicted_noise = self.model(x_t, t_batch)
         
         # Compute previous sample
-        alpha_t = self.alphas[t]
-        alpha_cumprod_t = self.alphas_cumprod[t]
-        beta_t = self.betas[t]
-        
-        model_mean = (1 / torch.sqrt(alpha_t)) * (
-            x_t - (beta_t / torch.sqrt(1 - alpha_cumprod_t)) * predicted_noise
-        )
-        
-        if t > 0:
-            noise = torch.randn_like(x_t)
-            variance = beta_t
-            return model_mean + torch.sqrt(variance) * noise
-        else:
-            return model_mean
+        with torch.no_grad():
+            alpha_t = self.alphas[t]
+            alpha_cumprod_t = self.alphas_cumprod[t]
+            beta_t = self.betas[t]
+            
+            model_mean = (1 / torch.sqrt(alpha_t)) * (
+                x_t - (beta_t / torch.sqrt(1 - alpha_cumprod_t)) * predicted_noise
+            )
+            
+            if t > 0:
+                noise = torch.randn_like(x_t)
+                variance = beta_t
+                return model_mean + torch.sqrt(variance) * noise
+            else:
+                return model_mean
 
-    @torch.no_grad()
     def sample(self, shape, classifier=None, guidance_scale=1.0, target_label=None):
         """Generate samples using reverse diffusion"""
-        x = torch.randn(shape).to(self.device)
+        with torch.no_grad():
+            x = torch.randn(shape).to(self.device)
         
         for t in reversed(range(self.timesteps)):
             x = self.p_sample(x, t, classifier, guidance_scale, target_label)
